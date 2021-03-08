@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+
+use Genome;
+use Revision;
+use Library;
+use Users;
+use Memoize qw(memoize);
+use Genome::Process::Test::IntegrationTests;
+
+use strict;
+use warnings;
+
+# flush output buffer after every write or print
+local $| = 1;
+Library::setup_model_process_test();
+Library::set_genome_software_result_test_name();
+
+my $process = get_initial_process();
+Library::wait_for_process($process, get_timeout());
+
+UR::Context->current->reload($process);
+
+Library::check_process_failure($process);
+
+diff_process($process);
+
+# functions
+sub get_timeout {
+    my $DEFAULT_TIMEOUT = 6;
+    return Library::get_timeout_seconds($DEFAULT_TIMEOUT);
+}
+
+sub get_initial_process {
+    if (my $test_name = Genome::Config::get('software_result_test_name')) {
+        printf("software_result_test_name before getting process is %s\n",
+            $test_name);
+    } else {
+        print "software_result_test_name is not set\n";
+    }
+
+    my %test_configuration = %{test_configuration()};
+    my $command_class = $test_configuration{'command_class'};
+    my $process_type = $test_configuration{'process_type'};
+
+    my %command_inputs;
+    while (my ($property_name, $property_id) = each %{$test_configuration{command_object_inputs}}) {
+        my $property = $command_class->__meta__->properties(property_name => $property_name);
+        my $type = $property->data_type;
+        if ($property->is_many) {
+            $command_inputs{$property_name} = [map {$type->get($_)} @$property_id];
+        }
+        else {
+            $command_inputs{$property_name} = $type->get($property_id);
+        }
+    }
+    my $command = $command_class->create(%command_inputs);
+    $process = $command->execute;
+    UR::Context->commit;
+    return $process;
+}
+
+sub test_configuration {
+    return Genome::Process::Test::IntegrationTests::get_process_test_configuration(process_name());
+}
+
+sub process_name {
+    return 'trio_main';
+}
+
+sub diff_process {
+    my $process = shift;
+
+    printf('Starting diff (new process = %s)...', $process->id);
+    my $diff_cmd = Genome::Process::Command::DiffBlessed->create(
+        new_process => $process,
+        process_name => process_name(),
+    );
+    unless ($diff_cmd->execute) {
+        fail("Diff command failed to execute!\n");
+    }
+
+    if ($diff_cmd->has_diffs()) {
+        Library::send_diff_mail($diff_cmd);
+        exit(255);
+    }
+
+}
+
+sub fail {
+    Library::fail("test process", @_);
+}

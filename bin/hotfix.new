@@ -1,0 +1,171 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+require IO::File;
+require Getopt::Long;
+
+BEGIN {
+    require Cwd;
+    require File::Basename;
+    my $lib_dir = Cwd::abs_path(File::Basename::dirname(__FILE__) . '/../lib/');
+    unless (grep { $lib_dir eq Cwd::abs_path($_) } @INC) {
+        push @INC, $lib_dir;
+    }
+}
+
+require Defaults;
+require Snapshot;
+
+use File::Spec qw();
+use Git::Repository qw();
+
+my $help = '';
+unless(Getopt::Long::GetOptions('help' => \$help)) {
+    exit;
+}
+
+if ( @ARGV < 3 || $help) {
+    print "Usage: $0 pipeline ~/git/genome sdf123a 9843aac ~/git/ur 5s2gg2a\n";
+    exit;
+}
+
+unless (getpwuid($<) eq 'apipe-tester') {
+    print "ERROR: please create hotfix snapshots as apipe-tester.\n";
+    exit;
+}
+
+
+my $version = shift @ARGV;
+my $old_path;
+if ( $version =~ /pipeline/ ) {
+    $old_path = readlink(Defaults::CURRENT_PIPELINE());
+} elsif ( $version =~ /user/ ) {
+    $old_path = readlink(Defaults::CURRENT_USER());
+} elsif ( $version =~ /web/ ) {
+    $old_path = readlink(Defaults::CURRENT_WEB());
+} else {
+    $old_path = Snapshot::find_snapshot($version);
+}
+my $old_name = $old_path;
+$old_name =~ s/\/+$//;
+$old_name =~ s/.*\///;
+
+
+my $git_repo = shift @ARGV;
+unless (-d $git_repo) {
+    print "ERROR: please specify a git repo as second argument. '$git_repo' is not a directory.\n";
+    exit;
+}
+unless (@ARGV) {
+    print "ERROR: please specify git hashes as third+ arguments\n";
+    exit;
+}
+
+$git_repo = Git::Repository->new(work_tree => $git_repo);
+
+my $custom_path = Defaults::CUSTOM_PATH();
+my $new_path = "$custom_path/$old_name";
+if ( $old_name =~ /genome-\d+$/ ) {
+    $new_path .= '-fix1';
+}
+elsif ($old_name =~ /genome-\d+-fix(\d+)/) {
+    my $old_fix = $1;
+    my $new_fix = $old_fix + 1;
+    $new_path =~ s/\d+$/$new_fix/;
+}
+
+unless ( -d $old_path ) {
+    print "ERROR: old_path does not exists: $old_path\n";
+    exit;
+}
+
+if ( -d $new_path ) {
+    print "ERROR: new_path already exists: $new_path\n";
+    exit;
+}
+
+print "Old: $old_path\nNew: $new_path\n";
+
+print "Copying $old_path to $new_path...\n";
+unless(system("cp -a $old_path $new_path") == 0) {
+    print "ERROR: Failed to 'cp -a $old_path $new_path'\n";
+    print "You may want to remove $new_path.\n";
+    exit;
+}
+
+my @hotfixes_footer;
+for my $argv (@ARGV) {
+    my $git_hash;
+
+    if ( -d $argv ) {
+        $git_repo = Git::Repository->new(work_tree => $argv);
+        next;
+    }
+    else {
+        $git_hash = $argv;
+    }
+print "applying $git_hash\n";
+
+    my $git_repo_name;
+    my @remotes = $git_repo->run('remote', '-v');
+    my $git_remote = (grep { /origin/ } @remotes)[-1];
+    if ($git_remote) {
+        chomp $git_remote;
+        my @git_remote = split('/', $git_remote);
+        $git_repo_name = $git_remote[-1];
+        $git_repo_name =~ s/\ \(.*\)//;
+        $git_repo_name =~ s/\.git//;
+    }
+    else {
+        $git_repo_name = 'unknown';
+    }
+
+    my $range = "$git_hash^..$git_hash";
+    my @files = grep { $_ !~ /\.t$/ } $git_repo->run('diff', '--name-only', $range);
+    chomp @files;
+    unless (@files) {
+        print "ERROR: no files in commit: $git_hash\n";
+        exit;
+    }
+
+    my ($patch_file) = $git_repo->run('format-patch', '--output-directory', $new_path, $range, '--', @files);
+    unless (-f $patch_file) {
+        print "ERROR: patch file does not exist: $patch_file\n";
+        exit;
+    }
+    unless (-s $patch_file) {
+        print "ERROR: patch file has no size: $patch_file\n";
+        exit;
+    }
+print "patch file $patch_file\n";
+
+    my $hotfix_msg = $git_repo->run('show', '--oneline', '--name-only', $git_hash);
+    my $git_msg = (split(/\n/, $hotfix_msg))[0];
+    print "Generating patch for $git_msg and applying to $new_path...\n";
+
+    my $fix_version = $new_path; $fix_version =~ s/.*genome-\d+-fix//;
+    push @hotfixes_footer, "fix$fix_version: $git_repo_name $hotfix_msg\n";
+
+    # fix patch path since we move UR and Workflow's lib -> lib/perl
+    if ( $git_repo_name !~ /genome/ ) {
+        system("sed -r -e 's/(---|\\+\\+\\+)\\ (a|b)\\/lib\\//\\1\\ \\2\\/lib\\/perl\\//' -i $patch_file");
+    }
+
+print "patching: patch -p 1 -d $new_path -i $patch_file\n";
+    unless(system("patch -p 1 -d $new_path -i $patch_file") == 0) {
+        print "ERROR: Failed to patch $new_path!\n";
+        print "You may want to remove $new_path.\n";
+        exit;
+    }
+}
+
+print "\n\nWhat was the reason for this hotfix? (make this readable by public)\n";
+my $hotfix_reason;
+chomp($hotfix_reason = <STDIN>);
+my $hotfixes_fh = IO::File->new(">>$new_path/hotfixes");
+my $fix_version = $new_path; $fix_version =~ s/.*genome-\d+-fix//;
+print $hotfixes_fh "Fix $fix_version: $hotfix_reason\n";
+
+print "Successfully created hotfix at $new_path\n";

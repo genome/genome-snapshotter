@@ -1,0 +1,10 @@
+#!/usr/bin/perl
+
+my @hosts = qx(bjobs -W -u apipe-tester | grep 'ur test run' | awk '{print \$6}');
+chomp @hosts;
+
+for my $host (@hosts) {
+    print "Host: $host\n";
+    system("ssh $host ps aux 2> /dev/null | grep ^13023 | grep -v '/usr/local/lsf' | grep -v 'ur test run'");
+}
+

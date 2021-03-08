@@ -1,0 +1,23 @@
+#!/usr/bin/env genome-perl
+
+use strict;
+use warnings;
+
+use Genome;
+
+my $table_name = Genome::SubjectAttribute->__meta__->table_name;
+
+my $SQL = qq(select distinct(s1.subject_id) from $table_name as s1 join $table_name as s2 on s1.subject_id = s2.subject_id and s1.attribute_label = 'source_id' and s2.attribute_label = 'source_id' and s1.ctid != s2.ctid);
+
+my $ds = Genome::DataSource::GMSchema->get();
+my $db = $ds->get_default_dbh();
+my $st = $db->prepare($SQL);
+$st->execute() or die $st->errstr;
+my $data = $st->fetchall_arrayref() or die $st->errstr;
+$st->finish();
+
+my @data = @$data;
+if (@data) {
+    print join("\n", @data), "\n";
+    exit 128;
+}

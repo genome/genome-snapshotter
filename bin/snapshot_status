@@ -1,0 +1,123 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use autodie ':all';
+use IPC::System::Simple qw(capture run);
+require Getopt::Long;
+
+BEGIN {
+    require Cwd;
+        require File::Basename;
+    my $lib_dir = Cwd::abs_path(File::Basename::dirname(__FILE__) . '/../lib/');
+    unless (grep { $lib_dir eq Cwd::abs_path($_) } @INC) {
+        push @INC, $lib_dir;
+    }
+}
+
+require Defaults;
+require Snapshot;
+
+use above 'Genome';
+
+my ($all, $archive, $check_lsf) = ('', '', '');
+my $getoptions_rv = Getopt::Long::GetOptions(
+    all => \$all,
+    archive => \$archive,
+    'check-lsf' => \$check_lsf,
+);
+exit unless($getoptions_rv);
+
+my @versions;
+if ($all) {
+    @versions = get_all_versions();
+}
+else {
+    @versions = @ARGV;
+}
+
+if ($archive && !$check_lsf) {
+    print "Since --archive was given I am forcing --check-lsf.\n";
+    $check_lsf = 1;
+}
+
+my $min_atime = 3600; # atime is in seconds
+print "VERSION\tELAPSED_GENOME_ATIME\tACTIVE_BUILDS\tACTIVE_LSF\tSTATUS\n";
+for my $version (@versions) {
+    my $elapsed_atime = elapsed_atime($version);
+    my $active_builds = active_builds($version);
+    my $has_lsf_jobs = has_active_lsf_jobs($version);
+    my $is_latest_stable_snapshot = is_latest_stable_snapshot($version);
+
+    print "$version\t$elapsed_atime\t$active_builds\t$has_lsf_jobs\t";
+    if ($elapsed_atime > $min_atime && $active_builds == 0
+        && (!$check_lsf || ($check_lsf && $has_lsf_jobs == 0))
+        && older_than_pipeline($version)
+        && !$is_latest_stable_snapshot) {
+            print "stale\n";
+            if ($archive) {
+                my $archive_dir = Defaults::OLD_PATH();
+                my $snapshot_dir = Snapshot::find_snapshot($version);
+                my $snapshot = Snapshot->open($snapshot_dir);
+                $snapshot->move_to('old');
+                $snapshot_dir = $snapshot->{snapshot_dir};
+                run(qq(chmod -R o-rwx "$snapshot_dir"));
+            }
+    }
+    else {
+        print "fresh\n";
+    }
+}
+
+sub is_latest_stable_snapshot {
+    my $version = shift;
+    my ($latest_stable_version) = capture(q(curl -sk "https://apipe-ci.gsc.wustl.edu/job/3-Create-Genome-Snapshot/lastStableBuild/api/xml?xpath=freeStyleBuild/number")) =~ /<number>(\d+)<\/number>/;
+    return ($latest_stable_version && $version =~ /^genome-$latest_stable_version/);
+}
+
+sub get_all_versions {
+    my @versions;
+    my $custom_dir = Defaults::CUSTOM_PATH();
+    my $snapshots_dir = Defaults::SNAPSHOTS_PATH();
+    for my $dir ($custom_dir, $snapshots_dir) {
+        chomp(my @dirs = capture(qq(find "$dir" -maxdepth 1 -name 'genome-*')));
+        map { $_ =~ s/.*\/// } @dirs;
+        push @versions, @dirs;
+    }
+    return sort @versions;
+}
+
+sub older_than_pipeline {
+    my $version = shift || die;
+    my ($version_number) = $version =~ /genome-(\d+)/;
+    my $current_path = readlink(Defaults::CURRENT_PIPELINE()) || die;
+    my ($current_version) = $current_path =~ /.*\/genome-(\d+)/;
+    return ($version_number < $current_version);
+}
+
+sub elapsed_atime {
+    my $version = shift || die;
+    my $snapshot_dir = Snapshot::find_snapshot($version) || die;
+    my $genome_module = "$snapshot_dir/lib/perl/Genome.pm";
+    my $atime = (stat($genome_module))[8];
+    my $elapsed_atime = time - $atime;
+    return $elapsed_atime;
+}
+
+sub active_builds {
+    my $version = shift || die;
+    my @active_builds = ();
+    push @active_builds, Genome::Model::Build->get(status => 'Running', 'software_revision like' => "\%/$version/\%");
+    return @active_builds;
+}
+
+sub has_active_lsf_jobs {
+    my $version = shift || die;
+    if ($check_lsf) {
+        my @bjobs_output = capture(q(bjobsu -l -u all));
+        return grep { $_ =~ /\/$version\// } @bjobs_output;
+    }
+    else {
+        return '-';
+    }
+}

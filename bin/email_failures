@@ -1,0 +1,301 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use XML::Simple;
+use Data::Dumper;
+use Mail::Sendmail;
+
+BEGIN {
+    require Cwd;
+	require File::Basename;
+    my $lib_dir = Cwd::abs_path(File::Basename::dirname(__FILE__) . '/../lib/');
+    unless (grep { $lib_dir eq Cwd::abs_path($_) } @INC) {
+        push @INC, $lib_dir;
+    }
+}
+
+use Users;
+require Defaults;
+require Cwd;
+require Mail::Sender;
+require LWP::Simple;
+
+
+use Getopt::Long;
+my $subject_prefix = '';
+GetOptions(
+    'subject-prefix=s' => \$subject_prefix,
+);
+
+
+my @xml_files = qx[find test_results -name '*.junit.xml'];
+map { chomp $_ } @xml_files;
+
+my $failure_count = 0;
+for my $xml_file (@xml_files) {
+    my $xml = XMLin($xml_file) || die "failed to parse junit results xml file: $xml_file";
+    my $testsuite = $xml->{'testsuite'};
+    next unless ($testsuite->{failures} || $testsuite->{errors});
+    $failure_count++;
+}
+
+print "Found $failure_count failures in " . @xml_files . " test reports.\n";
+
+if ($failure_count > 100) {
+    send_catastrophic_failure_alert();
+    exit;
+}
+
+for my $xml_file (@xml_files) {
+    my $xml = XMLin($xml_file) || die "failed to parse junit results xml file: $xml_file";
+    my $testsuite = $xml->{'testsuite'};
+    next unless ($testsuite->{failures} || $testsuite->{errors});
+    print $testsuite->{name} . "\n";
+    send_alert($testsuite);
+}
+
+exit;
+
+sub send_catastrophic_failure_alert {
+    my @us = map { $_ . '@genome.wustl.edu' } Users::apipe();
+    my $us = join(',', @us);
+    my $subject = 'Over 100 Tests Failed - Suppressing Normal Failure Messages';
+    $subject = join(' ', $subject_prefix, $subject) if $subject_prefix;
+    send_mail(
+        to      => $us,
+        subject => $subject,
+        msg     => 'Please visit Hudson (http://apipe-ci.gsc.wustl.edu) and verify that this is not a catastrophic failure!',
+    );
+}
+
+sub get_revision_info {
+    my $revision = qx(git describe --tags);
+    chomp($revision);
+    return $revision;
+}
+
+sub message_body {
+    my $testsuite = shift;
+    my $name = $testsuite->{name};
+    my $failure_count = $testsuite->{failures};
+    my $error_count = $testsuite->{errors};
+    my $system_err = $testsuite->{'system-err'}; chomp $system_err;
+    my $system_out = $testsuite->{'system-out'}; chomp $system_out;
+    my $error = ($testsuite->{error}{message} || ''); chomp $error;
+
+    my $testcases = $testsuite->{testcase};
+    if (exists $testcases->{time}) {
+        my $test_name = delete $testcases->{name};
+        $testcases = {$test_name => $testcases};
+    }
+    my @failed_tests;
+    for my $test (keys %{$testcases}) {
+        push @failed_tests, $test if ($testcases->{$test}{failure});
+    }
+
+    my $message_body;
+
+    if ($failure_count) {
+        $message_body .= "\nFailures ($failure_count):\n";
+        $message_body .= join("\n", map { ($testcases->{$_}{message} || '') } @failed_tests) . "\n\n";
+    }
+
+    if ($error_count) {
+        $message_body .= "\nErrors ($error_count):\n";
+        $message_body .= "$error\n\n";
+    }
+
+    my $revision = get_revision_info();
+    my $jenkins_url = $ENV{BUILD_URL} || 'unknown';
+    $message_body .= "Genome Version: " . $revision . "\n";
+    $message_body .= "Jenkins URL: " . $jenkins_url . "\n";
+    if (not ref $system_err) {
+        $message_body .= "\n++++system err++++\n";
+        $message_body .= truncate_over_4k($system_err) . "\n";
+        $message_body .= "----system err----\n";
+    }
+
+    if (not ref $system_out) {
+        $message_body .= "\n++++system out++++\n";
+        $message_body .= truncate_over_4k($system_out) . "\n";
+        $message_body .= "----system out----\n";
+    }
+
+    return $message_body;
+}
+
+sub truncate_over_4k {
+    my $text = shift;
+    my $max_bytes = 4096;
+    my $length  = length($text);
+    if ($length > $max_bytes) {
+        $text .= "*** Output was truncated because it was too large. Visit the hudson URL above for the full output. ***\n\n";
+        $text  = substr($text, $length - $max_bytes); # truncate output
+        $text .= "\n\n*** Output was truncated because it was too large. Visit the hudson URL above for the full output. ***";
+    }
+    return $text;
+}
+
+sub send_alert {
+    my $testsuite = shift;
+    
+    my $path = $testsuite->{name};
+    $path =~ s/_/\//g;
+    $path =~ s/\/t$/.t/;
+    
+    my ($to, $cc, $names) = git_blame($path);
+    my $mail_to = join(',', @$to);
+    my $mail_cc = join(',', @$cc);
+    my $mail_subject = "$path - " . join(', ', @$names);
+    $mail_subject = join(' ', $subject_prefix, $mail_subject) if $subject_prefix;
+    my $mail_msg = message_body($testsuite);
+
+    my $user_name = getpwuid($<);
+    my $mail_from = $user_name . '@genome.wustl.edu';
+
+    if (my $debug_email = $ENV{DEBUG_EMAIL}) {
+        $mail_msg = "To: $mail_to\nCC: $mail_cc\n" . $mail_msg;
+        send_mail(
+            to => $debug_email,
+            subject => '[DEBUG]' . $mail_subject,
+            msg     => $mail_msg,
+        );
+    } else {
+        print join("\n", "To: $mail_to", "CC: $mail_cc", "Subject: $mail_subject") . "\n";
+        send_mail(
+            to => $mail_to,
+            replyto => "$mail_from,$mail_to",
+            cc => $mail_cc,
+            subject => $mail_subject,
+            msg     => $mail_msg,
+        );
+    }
+    return 1;
+};
+
+sub git_blame {
+    my $job = $ENV{JOB_NAME} || die;
+    # 'snapshot' is unfortunately very tied to Genome but I think this whole script is
+    my $last_stable_hash = eval { _hash_for_build($job, 'lastStableBuild') } || 'snapshot';
+    my $last_hash = _hash_for_build($job, 'lastBuild');
+
+    my @emails;
+    push @emails, 'apipe-tester@genome.wustl.edu';
+    push @emails, _emails_of_committers_between($last_stable_hash, $last_hash);
+
+    my $apiper_assigned = 0;
+    my %us = map { $_ . '@genome.wustl.edu' => 1} Users::apipe();
+    for my $email (@emails) {
+        if(exists $us{$email}) {
+            $apiper_assigned = 1;
+            delete $us{$email}
+        }
+    }
+    unless ($apiper_assigned) {
+        my @us = keys %us;
+        my $random_apiper = $us[int(rand(@us))];
+        delete $us{$random_apiper};
+        push @emails, $random_apiper;
+    }
+
+    my @us = keys %us;
+    my @to_emails = @emails;
+    my @cc_emails = @us;
+    my @usernames = map { $_ =~ /(.*)\@/ } grep { $_ !~ /^apipe\-tester/ } @to_emails;
+
+    return (\@to_emails, \@cc_emails, \@usernames);
+}
+
+sub _emails_of_committers_between {
+    my $start_hash = shift || die;
+    my $end_hash = shift || die;
+
+    my $repo = Defaults::GIT_REPOS_BASE() . '/genome';
+    chomp(my @log = qx(git log $start_hash..$end_hash));
+    my @authors = grep { $_ =~ /^Author:\ / } @log;
+    my @emails = map { $_ =~ /<([^>]+)>$/ } @authors;
+
+    @emails = _unique_elements(@emails);
+
+    return @emails;
+}
+
+sub _hash_for_build {
+    my $job = shift || die;
+    my $build = shift || die;
+
+    my $url = "http://apipe-ci.gsc.wustl.edu/job/$job/$build/consoleText";
+    my $content = LWP::Simple::get($url);
+    die "Unable to get URL ($url).\n" unless ($content);
+
+    my @content = grep { $_ =~ /Commencing\ build\ of\ Revision/ } split("\n", $content);
+    die "More than one line matched 'Commencing build of Revision' for $url.\n" unless (@content == 1);
+
+    my ($hash) = $content[0] =~ /Commencing\ build\ of\ Revision\ (\S+)/;
+    die "Failed to parse hash from content of $url.\n" unless ($hash);
+
+    return $hash;
+}
+
+sub _unique_elements {
+    my @list = @_;
+    my %seen = ();
+    my @unique = grep { ! $seen{$_} ++ } @list;
+    return @unique;
+}
+
+sub filter_emails {
+    # this is to basically filter out committer emails which are often invalid
+    # in our case like usernam@somedesktop.gsc.wustl.edu
+    my $emails = shift || die;
+    my @ignored_users = Users::apipe_ignore();
+    my @emails = split(',', $emails);
+    my @filtered_emails;
+    for my $email (@emails) {
+        next if $email =~ /\.gsc\.wustl\.edu$/;
+        next if grep { $email =~ /^$_\@/ } @ignored_users;
+        push @filtered_emails, $email;
+    }
+    $emails = join(',', @filtered_emails);
+    return $emails;
+}
+
+sub send_mail {
+    my %params = @_;
+    my $to = delete $params{to} || 'apipe-tester@genome.wustl.edu';
+    my $from = delete $params{from} || 'apipe-tester@genome.wustl.edu';
+    my $subject = delete $params{subject} || 'No Subject';
+    my $msg = delete $params{msg} || 'No message.';
+    my $fallback_to = delete $params{fallback_to} || $ENV{DEBUG_FALLBACK_EMAIL} || 'apipe-tester@genome.wustl.edu';
+    my $smtp = delete $params{smtp} || 'gscsmtp.wustl.edu';
+    my $cc = delete $params{cc};
+    my $replyto = delete $params{replyto};
+
+    $to = filter_emails($to);
+    $cc = filter_emails($cc);
+    $replyto = filter_emails($replyto);
+    $from = filter_emails($from);
+
+    my $sender = Mail::Sender->new({
+        smtp => $smtp,
+        from => $from,
+    });
+    my $rv = $sender->MailMsg({
+        to => $to,
+        subject => $subject,
+        msg => $msg,
+        cc => $cc,
+        replyto => $replyto,
+    });
+    # MailMsg returns the $sender object on success
+    unless (ref $rv) {
+        my $fallback_msg = join("\n", "To: " . $to, 'CC: ' . $cc, 'Reply-To: ' . $replyto, "Subject: " . $subject, "\n\n" . $msg);
+        my $fallback_subject = 'Failed to Send Message: ' . $subject;
+        $sender->MailMsg({
+            to => $fallback_to,
+            subject => $fallback_subject,
+            msg     => $fallback_msg,
+        });
+    }
+}

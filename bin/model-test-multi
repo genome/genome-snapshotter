@@ -1,0 +1,157 @@
+#!/usr/bin/perl
+
+use Genome;
+use Revision;
+use Library;
+use Users;
+use JenkinsData;
+use Memoize qw(memoize);
+
+use strict;
+use warnings;
+
+
+# flush output buffer after every write or print
+local $| = 1;
+Library::setup_model_process_test();
+
+
+unless (should_shortcut(model_subname())) {
+    Library::set_genome_software_result_test_name();
+}
+
+if (Genome::Sys->username eq 'apipe-tester' && !$ENV{MODEL_TEST_TO}) {
+    my $build_type = build_type();
+    if (Users->can($build_type)) {
+        $ENV{MODEL_TEST_TO} = Library::users_to_addresses(Users->$build_type);
+    }
+}
+
+my $build = get_initial_build();
+my $start_time = time;
+Library::wait_for_build($build, $start_time, get_timeout());
+
+$build = UR::Context->current->reload('Genome::Model::Build', id => $build->id);
+
+Library::check_build_failure($build);
+
+diff_build($build);
+
+
+# functions
+sub build_type {
+    my $type = model()->class;
+    $type =~ s/Genome::Model:://;
+    $type =~ s/:://g;
+    return Genome::Utility::Text::camel_case_to_string($type, '_');
+}
+
+sub model_subname {
+    my $test_spec = JenkinsData->test_spec;
+    my ($perl_version, $model_subname) = $test_spec =~ /(.*?)-(.*)/;
+    if ($perl_version ne Revision->perl_version()) {
+        fail("Perl version specified by TEST_SPEC (%s) does not match running version (%S)!\n",
+            $perl_version, Revision->perl_version());
+    }
+    return $model_subname;
+}
+
+sub should_shortcut {
+    my @MODELS_THAT_ARE_FAST_AND_DONT_NEED_TO_SHORTCUT = (
+        'reference-alignment',
+        'rnaseq',
+        'somatic-variation',
+        'somatic-short',
+        'somatic-validation',
+        'somatic-variation-short',
+        'somatic-variation-sv-detection',
+    );
+    my $model_subname = shift;
+    return !grep {$_ eq $model_subname} @MODELS_THAT_ARE_FAST_AND_DONT_NEED_TO_SHORTCUT;
+}
+
+memoize('model');
+sub model {
+    my $model_name = sprintf('apipe-test-%s', model_subname());
+    my $model = Genome::Model->get(name => $model_name);
+    if ($model) {
+        printf("Found model (%s) with name '%s'.\n\n", $model->id, $model->name);
+    } else {
+        fail("Could not get test model by name (%S)!\n\n", $model_name);
+    }
+    return $model;
+}
+
+sub get_timeout {
+    my %MODEL_TIMEOUTS = (
+        'somatic-variation' => 36,
+    );
+    my $DEFAULT_TIMEOUT = 18;
+    my $timeout_hours = $MODEL_TIMEOUTS{model_subname()} || $DEFAULT_TIMEOUT;
+    return Library::get_timeout_seconds($timeout_hours);
+}
+
+sub create_build {
+    print("Creating new build....\n");
+    my $build = Genome::Model::Build->create(
+        model_id => model()->id,
+        software_revision => Library::test_version(),
+    );
+    unless ($build) {
+        fail("Could not create new build!\n");
+    }
+    print("Starting build...\n");
+    unless ($build->start()) {
+        fail("Cound not start new build!\n");
+    }
+    print("Saving build...\n");
+    unless (UR::Context->commit()) {
+        fail("Could not save new build!\n");
+    }
+    print("Build saved.\n");
+    return $build;
+}
+
+sub get_initial_build {
+    if (my $test_name = Genome::Config::get('software_result_test_name')) {
+        printf("software_result_test_name before getting build is %s\n", $test_name);
+    } else {
+        print "software_result_test_name is not set\n";
+    }
+
+    my $build =  Genome::Model::Build->get(
+        model_name => model()->name,
+        run_by => Genome::Sys->username,
+        software_revision => Library::test_version(),
+        status => ['Scheduled', 'Running', 'Succeeded'],
+    );
+
+    if ($build) {
+        printf("Got existing build (%s) for current test version.\n", $build->__display_name__);
+    } else {
+        $build = create_build();
+    }
+    return $build;
+}
+
+sub diff_build {
+    my $build = shift;
+
+    printf('Starting diff (new build = %s)...', $build->id);
+    my $diff_cmd = Genome::Model::Build::Command::DiffBlessed->create(
+        new_build => $build,
+    );
+    unless ($diff_cmd->execute) {
+        fail("Diff command failed to execute!\n");
+    }
+
+    if ($diff_cmd->has_diffs()) {
+        Library::send_diff_mail($diff_cmd);
+        exit(255);
+    }
+
+}
+
+sub fail {
+    Library::fail("test model", @_);
+}

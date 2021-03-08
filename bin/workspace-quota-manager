@@ -1,0 +1,107 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Genome;
+use Library;
+
+my $allocation_path = shift @ARGV;
+my $a = Genome::Disk::Allocation->get(allocation_path => $allocation_path);
+unless ($a) {
+    print("ERROR: Unable to get allocation: $allocation_path\n") and exit 255;
+}
+
+my $kb_requested = $a->kilobytes_requested;
+unless ($kb_requested) {
+    print("ERROR: Unable to get kilobytes_requested!\n") and exit 255;
+}
+
+my $path = $a->absolute_path;
+unless ($path) {
+    print("ERROR: Unable to get absolute_path!\n") and exit 255;
+}
+unless (-d $path) {
+    printf("ERROR: Path (%s) is not a directory!\n", $path) and exit 255;
+}
+
+my ($kb_used) = qx(du -ks $path) =~ /^(\d+)/;
+unless ($kb_used) {
+    print("ERROR: Unable to parse kb_used!\n") and exit 255;
+}
+
+my $percent_used = $kb_used / $kb_requested * 100;
+
+if ($percent_used > 95.0) {
+
+    my $new_kb_requested = int(1.05 * ($percent_used / 95.0) * $kb_requested);
+    my $kb_delta = $new_kb_requested - $kb_requested;
+    if ($kb_delta < 0) {
+        die 'Trying to reallocate to smaller size should not happen!';
+    }
+
+    my $subject;
+
+    my @ls = qx(ls -ltr $path);
+    chomp @ls;
+
+    my $tx = UR::Context::Transaction->begin();
+    my $rv = eval { $a->reallocate(kilobytes_requested => $new_kb_requested) };
+    my $error_message = $@;
+    my @body;
+    if ($rv) {
+        $tx->commit();
+        $subject = 'Automatically Resized Jenkins Workspace';
+        @body = (
+            'Verify that new content is expected (via its respective owner).',
+        );
+        if ($ENV{JOB_NAME}) {
+            push @body, 'Jenkins Job: ' . $ENV{JOB_NAME};
+        }
+        if ($ENV{BUILD_URL}) {
+            push @body, 'Build URL: ' . $ENV{BUILD_URL};
+        }
+        push @body, (
+            '',
+            sprintf("Automatically resized Jenkins' workspace by %.2f MB, from %.2f GB to %.2f GB.", $kb_delta / 1024.0, $kb_requested / 1048576.0, $new_kb_requested / 1048576.0),
+            sprintf("Allocation path is '%s'.", $a->allocation_path),
+            sprintf("Absolute path is '%s'.", $a->absolute_path),
+            @ls,
+        );
+        $percent_used = $kb_used / $new_kb_requested * 100;
+        printf("Allocation Usage OK: %.2f%%\n", $percent_used);
+    } else {
+        $tx->rollback();
+        $subject = 'Failed to Automatically Resize Jenkins Workspace';
+        @body = (
+            'Verify that new content is expected (via its respective owner) and determine why resize failed.',
+        );
+        if ($ENV{JOB_NAME}) {
+            push @body, 'Jenkins Job: ' . $ENV{JOB_NAME};
+        }
+        if ($ENV{BUILD_URL}) {
+            push @body, 'Build URL: ' . $ENV{BUILD_URL};
+        }
+        push @body, (
+            '',
+            sprintf("Failed to automatically resize Jenkins' workspace by %.2f MB, from %.2f GB to %.2f GB.", $kb_delta / 1024.0, $kb_requested / 1048576.0, $new_kb_requested / 1048576.0),
+            sprintf("Allocation path is '%s'.", $a->allocation_path),
+            sprintf("Error:\n%s", $error_message),
+            sprintf("Absolute path is '%s'.", $a->absolute_path),
+            @ls,
+        );
+        printf("Allocation Usage NOT OK: %.2f%%\n", $percent_used);
+    }
+
+    Library::send_mail(
+        from => 'apipe-tester@genome.wustl.edu',
+        to => 'apipe-tester@genome.wustl.edu',
+        subject => $subject,
+        body => join("\n", @body),
+    );
+
+    UR::Context->commit;
+    exit($rv ? 0 : 1);
+} else {
+    printf("Allocation Usage OK: %.2f%%\n", $percent_used);
+}

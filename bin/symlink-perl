@@ -1,0 +1,18 @@
+#!/bin/bash
+
+set -o nounset
+set -o errexit
+
+echo -e "\n=> Symlinking Perl Interpreter..." 1>&2
+
+PERL_VERSION="$1"
+
+if ! test -d "$WORKSPACE/bin"
+then
+    mkdir "$WORKSPACE/bin"
+fi
+
+if test -f "$WORKSPACE/bin/genome-perl$PERL_VERSION" -a "genome-perl$PERL_VERSION" != "$(readlink "$WORKSPACE/bin/genome-perl")"
+then
+    ( set -o xtrace; ln -nsf "$WORKSPACE/bin/genome-perl"{$PERL_VERSION,} )
+fi
