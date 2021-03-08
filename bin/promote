@@ -91,9 +91,9 @@ sub promote {
         return 1;
     }
 
-    my $file_lock = Fcntl::FileLock->create(path => '/gsc/var/lock/genome/promote.lock');
+    my $file_lock = Fcntl::FileLock->create(path => '/gscmnt/gc2560/core/site_locks/genome/promote.lock');
     my $start_time = time;
-    while (!$file_lock->lock) {
+    while (0 && !$file_lock->lock) {
         my $errno = $!;
         if ((time - $start_time) >= 300) {
             my $is_locked = $file_lock->is_locked(); # returns PID of process that has lock or zero
@@ -132,7 +132,7 @@ sub promote {
 
     unless ($test) {
         update_symlinks(build_name => $NEW_BUILD_NAME, symlink_name => $symlink_name) || die;
-        send_announcement_email(subject => $promote_subject, msg => $changes_summary);
+        #send_announcement_email(subject => $promote_subject, msg => $changes_summary);
     }
 
     unlink($changes_summary_file);
@@ -204,7 +204,7 @@ sub create_changes_summary {
 
 
     # create git-changelog
-    my $git_changelog_lock_file = "/gsc/var/lock/genome/promote_changelog.lock";
+    my $git_changelog_lock_file = "/gscmnt/gc2560/core/site_locks/genome/promote_changelog.lock";
     if (-e $git_changelog_lock_file) {
         my $start_time = time;
         while (-e $git_changelog_lock_file) {
@@ -216,9 +216,7 @@ sub create_changes_summary {
         system("touch $git_changelog_lock_file");
     }
 
-    if ($old_git_version ne $new_git_version) {
-        run("$BIN_DIR/changelog $old_git_version $new_git_version > $snapshot_path/git-changelog");
-    }
+    #run("$BIN_DIR/changelog $old_git_version $new_git_version > $snapshot_path/git-changelog");
 
     # create CHANGE_SUMMARY
     unlink("$snapshot_path/CHANGE_SUMMARY");
@@ -255,7 +253,7 @@ sub send_announcement_email {
         die "Invalid params passed to send_announcement_email: " . join(', ', @params_keys) . ".\n";
     }
 
-    my $mail_to = 'genome-announce@genome.wustl.edu';
+    my $mail_to = 'gms@gowustl.onmicrosoft.com';
     my $user_name = getpwuid($<);
     my $mail_from = $user_name . '@genome.wustl.edu';
 
